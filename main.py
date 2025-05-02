@@ -61,7 +61,7 @@ async def confirm_code(request: ConfirmCodeRequest):
         await client.connect()
         await client.sign_in(request.phone_number, request.code, phone_code_hash=request.phone_code_hash)
         await client.disconnect()
-        return {"status": "authorized"}
+        return {"status": "authorized", "phone_number": request.phone_number, "api_id": request.api_id, "api_hash": request.api_hash}
     except Exception as e:
         return {"error": str(e)}
 
