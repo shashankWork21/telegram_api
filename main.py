@@ -46,7 +46,8 @@ async def send_code(request: SendCodeRequest):
     try:
         result = await client.send_code_request(request.phone_number)
         await client.disconnect()
-        return {"status": "code_sent", "phone_code_hash": result.phone_code_hash}
+        print(result)
+        return {"status": "code_sent", "phone_code_hash": result.phone_code_hash, "phone_number": request.phone_number, "api_id": request.api_id, "api_hash": request.api_hash}
     except Exception as e:
         return {"error": str(e)}
 
