@@ -4,6 +4,7 @@ from telethon.tl.functions.messages import GetHistoryRequest
 from datetime import datetime, timezone
 import os
 from pydantic import BaseModel
+from typing import Union, List, Optional
 
 app = FastAPI()
 
@@ -22,6 +23,11 @@ class ConfirmCodeRequest(BaseModel):
 
 class DeleteSessionRequest(BaseModel):
     phone_number: str
+
+class GetDialogsRequest(BaseModel):
+    phone_number: str
+    api_id: int
+    api_hash: str
 
 
 def session_path(phone_number: str) -> str:
@@ -46,8 +52,7 @@ async def send_code(request: SendCodeRequest):
     try:
         result = await client.send_code_request(request.phone_number)
         await client.disconnect()
-        print(result)
-        return {"status": "code_sent", "phone_code_hash": result.phone_code_hash, "phone_number": request.phone_number, "api_id": request.api_id, "api_hash": request.api_hash}
+        return {"status": "code_sent", "phone_code_hash": result.phone_code_hash, "api_id": request.api_id, "api_hash": request.api_hash, "phone_number": request.phone_number}
     except Exception as e:
         return {"error": str(e)}
 
@@ -61,7 +66,7 @@ async def confirm_code(request: ConfirmCodeRequest):
         await client.connect()
         await client.sign_in(request.phone_number, request.code, phone_code_hash=request.phone_code_hash)
         await client.disconnect()
-        return {"status": "authorized", "phone_number": request.phone_number, "api_id": request.api_id, "api_hash": request.api_hash}
+        return {"status": "authorized"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -84,7 +89,7 @@ async def delete_session(request: DeleteSessionRequest):
 
 @app.get("/get_messages")
 async def get_messages(
-    channel_name: str,
+    channel_id: Union[int, str],
     api_id: int,
     api_hash: str,
     phone_number: str,
@@ -97,6 +102,10 @@ async def get_messages(
     except ValueError:
         raise HTTPException(status_code=400, detail="Date must be in DD/MM/YYYY format")
 
+    # Try to convert channel_id to int if it's numeric
+    if isinstance(channel_id, str) and channel_id.isdigit():
+        channel_id = int(channel_id)
+
     session = session_path(phone_number)
     client = TelegramClient(session, api_id, api_hash)
 
@@ -104,13 +113,10 @@ async def get_messages(
         await client.start()
         
         try:
-            entity = await client.get_entity(channel_name)
+            # Get entity directly by ID
+            entity = await client.get_entity(channel_id)
         except:
-            dialogs = await client.get_dialogs()
-            group = next((d.entity for d in dialogs if d.name == channel_name), None)
-            if not group:
-                raise HTTPException(status_code=404, detail="Group not found")
-            entity = group
+            raise HTTPException(status_code=404, detail="Channel not found. Use /get_dialogs to find the correct channel ID.")
 
         offset_id = 0
         limit = 100
@@ -140,6 +146,9 @@ async def get_messages(
                             "message": msg.message
                         })
 
+            if not history.messages:
+                break
+                
             offset_id = history.messages[-1].id
 
         await client.disconnect()
