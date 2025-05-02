@@ -3,6 +3,7 @@ from telethon.sync import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
 from datetime import datetime, timezone
 import os
+import asyncio
 from pydantic import BaseModel
 from typing import Union, List, Optional
 
@@ -42,33 +43,44 @@ def session_path(phone_number: str) -> str:
 @app.post("/send_code")
 async def send_code(request: SendCodeRequest):
     session = session_path(request.phone_number)
-    client = TelegramClient(session, request.api_id, request.api_hash)
-
-    await client.connect()
-    if await client.is_user_authorized():
-        await client.disconnect()
-        return {"status": "already_authorized"}
-
+    client = None
+    
     try:
+        client = TelegramClient(session, request.api_id, request.api_hash)
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            return {"status": "already_authorized"}
+
         result = await client.send_code_request(request.phone_number)
-        await client.disconnect()
-        return {"status": "code_sent", "phone_code_hash": result.phone_code_hash, "api_id": request.api_id, "api_hash": request.api_hash, "phone_number": request.phone_number}
+        return {"status": "code_sent", "phone_code_hash": result.phone_code_hash}
+    
     except Exception as e:
         return {"error": str(e)}
+    
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
 
 
 @app.post("/confirm_code")
 async def confirm_code(request: ConfirmCodeRequest):
     session = session_path(request.phone_number)
-    client = TelegramClient(session, request.api_id, request.api_hash)
-
+    client = None
+    
     try:
+        client = TelegramClient(session, request.api_id, request.api_hash)
         await client.connect()
+        
         await client.sign_in(request.phone_number, request.code, phone_code_hash=request.phone_code_hash)
-        await client.disconnect()
         return {"status": "authorized"}
+    
     except Exception as e:
         return {"error": str(e)}
+    
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
 
 
 @app.delete("/delete_session")
@@ -87,6 +99,42 @@ async def delete_session(request: DeleteSessionRequest):
         return {"status": "error", "error": str(e)}
 
 
+@app.post("/get_dialogs")
+async def get_dialogs(request: GetDialogsRequest):
+    """Get all dialogs (chats/channels) with their IDs."""
+    session = session_path(request.phone_number)
+    client = None
+    
+    try:
+        client = TelegramClient(session, request.api_id, request.api_hash)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            return {"error": "User not authorized. Please authorize first."}
+        
+        dialogs = await client.get_dialogs()
+        dialog_list = []
+        
+        for dialog in dialogs:
+            entity = dialog.entity
+            dialog_info = {
+                "id": entity.id,
+                "name": dialog.name,
+                "type": "channel" if hasattr(entity, "broadcast") and entity.broadcast else "group" if hasattr(entity, "megagroup") and entity.megagroup else "chat",
+                "username": entity.username if hasattr(entity, "username") and entity.username else None
+            }
+            dialog_list.append(dialog_info)
+            
+        return {"dialogs": dialog_list}
+    
+    except Exception as e:
+        return {"error": str(e)}
+    
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
+
+
 @app.get("/get_messages")
 async def get_messages(
     channel_id: Union[int, str],
@@ -94,7 +142,8 @@ async def get_messages(
     api_hash: str,
     phone_number: str,
     from_date: str = Query(..., description="Format: DD/MM/YYYY"),
-    to_date: str = Query(..., description="Format: DD/MM/YYYY")
+    to_date: str = Query(..., description="Format: DD/MM/YYYY"),
+    limit: int = Query(100, description="Limit of messages per batch")
 ):
     try:
         from_dt = datetime.strptime(from_date, "%d/%m/%Y").replace(tzinfo=timezone.utc)
@@ -107,52 +156,69 @@ async def get_messages(
         channel_id = int(channel_id)
 
     session = session_path(phone_number)
-    client = TelegramClient(session, api_id, api_hash)
-
+    client = None
+    
     try:
-        await client.start()
+        client = TelegramClient(session, api_id, api_hash)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=401, detail="User not authorized. Please authorize first.")
         
         try:
             # Get entity directly by ID
             entity = await client.get_entity(channel_id)
-        except:
-            raise HTTPException(status_code=404, detail="Channel not found. Use /get_dialogs to find the correct channel ID.")
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"Channel not found: {str(e)}. Use /get_dialogs to find the correct channel ID.")
 
         offset_id = 0
-        limit = 100
         messages = []
+        
+        # Set a reasonable max messages limit to prevent overwhelming the API
+        max_messages = 1000
+        total_retrieved = 0
 
-        while True:
-            history = await client(GetHistoryRequest(
-                peer=entity,
-                offset_id=offset_id,
-                offset_date=None,
-                add_offset=0,
-                limit=limit,
-                max_id=0,
-                min_id=0,
-                hash=0
-            ))
-
-            if not history.messages:
-                break
-
-            for msg in history.messages:
-                if hasattr(msg, 'date') and hasattr(msg, 'message'):
-                    if from_dt <= msg.date <= to_dt and msg.message is not None:
-                        messages.append({
-                            "date": msg.date.isoformat(),
-                            "sender_id": msg.sender_id,
-                            "message": msg.message
-                        })
-
-            if not history.messages:
-                break
+        while total_retrieved < max_messages:
+            try:
+                history = await client(GetHistoryRequest(
+                    peer=entity,
+                    offset_id=offset_id,
+                    offset_date=None,
+                    add_offset=0,
+                    limit=min(limit, 100),  # Telegram API limit is 100
+                    max_id=0,
+                    min_id=0,
+                    hash=0
+                ))
                 
-            offset_id = history.messages[-1].id
+                if not history.messages:
+                    break
+                
+                for msg in history.messages:
+                    if hasattr(msg, 'date') and hasattr(msg, 'message'):
+                        if from_dt <= msg.date <= to_dt and msg.message is not None:
+                            messages.append({
+                                "date": msg.date.isoformat(),
+                                "sender_id": msg.sender_id,
+                                "message": msg.message
+                            })
+                
+                offset_id = history.messages[-1].id
+                total_retrieved += len(history.messages)
+                
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving messages: {str(e)}")
 
-        await client.disconnect()
-        return {"messages": messages}
-
+        return {"messages": messages, "count": len(messages)}
+    
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
